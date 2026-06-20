@@ -109,7 +109,7 @@ def _item_to_record(item: dict, repo_id: int, repo_name: str) -> dict:
         "repo": repo_name,
         "sha": item.get("sha"),
         "message": commit.get("message"),
-        "coderabbit_type_of_commit": classify_commit(commit.get("message", "")),
+        "commit_activity_type": classify_commit(commit.get("message", "")),
         "author_name": author.get("name"),
         "author_email": author.get("email"),
         "author_date": author.get("date"),

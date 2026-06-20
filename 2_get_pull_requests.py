@@ -164,7 +164,7 @@ def _search_window(base_query: str, start: date, end: date, repo_name: str) -> l
     return _fetch_window(query)
 
 
-def _item_to_record(item: dict, repo_id: int, repo_name: str, activity: str) -> dict:
+def _item_to_record(item: dict, repo_id: int, repo_name: str, coderabbit_activity: str) -> dict:
     return {
         "repo_id": repo_id,
         "repo": repo_name,
@@ -178,26 +178,26 @@ def _item_to_record(item: dict, repo_id: int, repo_name: str, activity: str) -> 
         "closed_at": item.get("closed_at"),
         "labels": [lbl.get("name") for lbl in item.get("labels", [])],
         "comments": item.get("comments"),
-        "activity": activity,
+        "coderabbit_activity": coderabbit_activity,
     }
 
 
-def search_prs_for_repo(repo_id: int, repo_name: str, activity: str) -> list[dict]:
+def search_prs_for_repo(repo_id: int, repo_name: str, coderabbit_activity: str) -> list[dict]:
     """
     Search merged PRs for a single repo filtered by coderabbitai[bot] activity.
-    activity='Reviewed'  -> reviewed-by:coderabbitai[bot]
-    activity='Authored'  -> author:coderabbitai[bot]
+    coderabbit_activity='Reviewed'  -> reviewed-by:coderabbitai[bot]
+    coderabbit_activity='Authored'  -> author:coderabbitai[bot]
     Uses monthly time windows with recursive bisection to stay under
     GitHub's 1000-result-per-query cap.
     """
-    if activity == "Authored":
+    if coderabbit_activity == "Authored":
         base_query = f"is:pr is:merged author:coderabbitai[bot] repo:{repo_name}"
     else:
         base_query = f"is:pr is:merged reviewed-by:coderabbitai[bot] repo:{repo_name}"
 
     # First check total without date filter
     total = _count_window(base_query)
-    print(f"  [{repo_name}] [{activity}] ~{total} total PRs reported by GitHub")
+    print(f"  [{repo_name}] [{coderabbit_activity}] ~{total} total PRs reported by GitHub")
 
     if total == 0:
         return []
@@ -205,7 +205,7 @@ def search_prs_for_repo(repo_id: int, repo_name: str, activity: str) -> list[dic
     if total < RESULT_CAP:
         # Simple case: fetch all at once
         items = _fetch_window(base_query)
-        return [_item_to_record(i, repo_id, repo_name, activity) for i in items]
+        return [_item_to_record(i, repo_id, repo_name, coderabbit_activity) for i in items]
 
     # Split by month from GitHub's launch (2023-01) up to today
     start = date(2023, 1, 1)
@@ -221,7 +221,7 @@ def search_prs_for_repo(repo_id: int, repo_name: str, activity: str) -> list[dic
             pr_id = item.get("number")
             if pr_id not in seen_ids:
                 seen_ids.add(pr_id)
-                results.append(_item_to_record(item, repo_id, repo_name, activity))
+                results.append(_item_to_record(item, repo_id, repo_name, coderabbit_activity))
         time.sleep(0.5)  # be polite between windows
 
     return results
@@ -247,29 +247,29 @@ def main():
     already_done: set[tuple[str, str]] = set()
     if os.path.exists(OUTPUT_PARQUET):
         existing_df = pd.read_parquet(OUTPUT_PARQUET)
-        # Back-compat: if old file lacks 'activity' column treat all as 'Reviewed'
-        if "activity" not in existing_df.columns:
-            existing_df["activity"] = "Reviewed"
+        # Back-compat: if old file lacks 'coderabbit_activity' column treat all as 'Reviewed'
+        if "coderabbit_activity" not in existing_df.columns:
+            existing_df["coderabbit_activity"] = "Reviewed"
         all_prs = existing_df.to_dict("records")
-        already_done = set(zip(existing_df["repo"], existing_df["activity"]))
-        print(f"Resuming: {len(already_done)} (repo, activity) pairs already processed.")
+        already_done = set(zip(existing_df["repo"], existing_df["coderabbit_activity"]))
+        print(f"Resuming: {len(already_done)} (repo, coderabbit_activity) pairs already processed.")
 
-    # Build work list: (repo_id, repo_name, activity) skipping completed pairs
+    # Build work list: (repo_id, repo_name, coderabbit_activity) skipping completed pairs
     work_items = [
-        (rid, repo, activity)
+        (rid, repo, coderabbit_activity)
         for rid, repo in repos
-        for activity in ACTIVITIES
-        if (repo, activity) not in already_done
+        for coderabbit_activity in ACTIVITIES
+        if (repo, coderabbit_activity) not in already_done
     ]
-    print(f"{len(work_items)} (repo, activity) pairs remaining.")
+    print(f"{len(work_items)} (repo, coderabbit_activity) pairs remaining.")
 
     lock = threading.Lock()
 
-    def process_repo(repo_id: int, repo_name: str, activity: str):
+    def process_repo(repo_id: int, repo_name: str, coderabbit_activity: str):
         nonlocal completed
-        print(f"Searching PRs [{activity}]: {repo_name}")
-        prs = search_prs_for_repo(repo_id, repo_name, activity)
-        print(f"  -> {len(prs)} PRs found for {repo_name} [{activity}]")
+        print(f"Searching PRs [{coderabbit_activity}]: {repo_name}")
+        prs = search_prs_for_repo(repo_id, repo_name, coderabbit_activity)
+        print(f"  -> {len(prs)} PRs found for {repo_name} [{coderabbit_activity}]")
         with lock:
             all_prs.extend(prs)
             completed += 1
@@ -280,15 +280,15 @@ def main():
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
-            executor.submit(process_repo, rid, repo, activity): (repo, activity)
-            for rid, repo, activity in work_items
+            executor.submit(process_repo, rid, repo, coderabbit_activity): (repo, coderabbit_activity)
+            for rid, repo, coderabbit_activity in work_items
         }
         for future in as_completed(futures):
-            repo, activity = futures[future]
+            repo, coderabbit_activity = futures[future]
             try:
                 future.result()
             except Exception as e:
-                print(f"  Error processing {repo} [{activity}]: {e}")
+                print(f"  Error processing {repo} [{coderabbit_activity}]: {e}")
 
     # Final save
     pd.DataFrame(all_prs).to_parquet(OUTPUT_PARQUET, index=False)
