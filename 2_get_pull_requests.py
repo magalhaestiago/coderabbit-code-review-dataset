@@ -1,15 +1,18 @@
 """
-For each repo in repositories.parquet, search GitHub for merged PRs reviewed by
-coderabbitai[bot] using the query: is:pr is:merged reviewed-by:coderabbitai[bot] repo:<owner>/<repo>
+For each repo in repositories.parquet, search GitHub for merged PRs where
+coderabbitai[bot] participated, using two queries per repo:
+  - Reviewed: is:pr is:merged reviewed-by:coderabbitai[bot] repo:<owner>/<repo>
+  - Authored: is:pr is:merged author:coderabbitai[bot] repo:<owner>/<repo>
 
 To overcome GitHub's 1000-result cap per query, the search is split into
 monthly time windows using the `merged:` qualifier. If a month still reports
 >1000 results it is split into weekly windows recursively, ensuring complete
 coverage regardless of PR volume.
 
-Outputs pr_links.parquet with PR metadata and repo_id foreign key linking to repositories.parquet.
+Outputs results/pull_requests.parquet with PR metadata, repo_id foreign key linking to
+results/repositories.parquet, and an `activity` column ("Reviewed" or "Authored").
 
-Set GITHUB_TOKEN_1 / _2 / _3 env variables to avoid rate limiting.
+Set GITHUB_TOKEN_1 / _2 / _3 / _4 env variables to avoid rate limiting.
 """
 
 import os
@@ -24,8 +27,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-INPUT_PARQUET = "repositories.parquet"
-OUTPUT_PARQUET = "pr_links.parquet"
+INPUT_PARQUET = "results/repositories.parquet"
+OUTPUT_PARQUET = "results/pull_requests.parquet"
 MAX_WORKERS = 3  # search API is stricter on rate limits
 PER_PAGE = 100   # max allowed by GitHub search API
 
@@ -161,11 +164,13 @@ def _search_window(base_query: str, start: date, end: date, repo_name: str) -> l
     return _fetch_window(query)
 
 
-def _item_to_record(item: dict, repo_id: int, repo_name: str) -> dict:
+def _item_to_record(item: dict, repo_id: int, repo_name: str, activity: str) -> dict:
+    pr_number = item.get("number")
     return {
+        "pr_id": f"{repo_id}_{pr_number}",
         "repo_id": repo_id,
         "repo": repo_name,
-        "pr_number": item.get("number"),
+        "pr_number": pr_number,
         "title": item.get("title"),
         "url": item.get("html_url"),
         "state": item.get("state"),
@@ -175,20 +180,26 @@ def _item_to_record(item: dict, repo_id: int, repo_name: str) -> dict:
         "closed_at": item.get("closed_at"),
         "labels": [lbl.get("name") for lbl in item.get("labels", [])],
         "comments": item.get("comments"),
+        "activity": activity,
     }
 
 
-def search_prs_for_repo(repo_id: int, repo_name: str) -> list[dict]:
+def search_prs_for_repo(repo_id: int, repo_name: str, activity: str) -> list[dict]:
     """
-    Search merged PRs reviewed by coderabbitai[bot] for a single repo.
+    Search merged PRs for a single repo filtered by coderabbitai[bot] activity.
+    activity='Reviewed'  -> reviewed-by:coderabbitai[bot]
+    activity='Authored'  -> author:coderabbitai[bot]
     Uses monthly time windows with recursive bisection to stay under
     GitHub's 1000-result-per-query cap.
     """
-    base_query = f"is:pr is:merged reviewed-by:coderabbitai[bot] repo:{repo_name}"
+    if activity == "Authored":
+        base_query = f"is:pr is:merged author:coderabbitai[bot] repo:{repo_name}"
+    else:
+        base_query = f"is:pr is:merged reviewed-by:coderabbitai[bot] repo:{repo_name}"
 
     # First check total without date filter
     total = _count_window(base_query)
-    print(f"  [{repo_name}] ~{total} total PRs reported by GitHub")
+    print(f"  [{repo_name}] [{activity}] ~{total} total PRs reported by GitHub")
 
     if total == 0:
         return []
@@ -196,7 +207,7 @@ def search_prs_for_repo(repo_id: int, repo_name: str) -> list[dict]:
     if total < RESULT_CAP:
         # Simple case: fetch all at once
         items = _fetch_window(base_query)
-        return [_item_to_record(i, repo_id, repo_name) for i in items]
+        return [_item_to_record(i, repo_id, repo_name, activity) for i in items]
 
     # Split by month from GitHub's launch (2023-01) up to today
     start = date(2023, 1, 1)
@@ -212,7 +223,7 @@ def search_prs_for_repo(repo_id: int, repo_name: str) -> list[dict]:
             pr_id = item.get("number")
             if pr_id not in seen_ids:
                 seen_ids.add(pr_id)
-                results.append(_item_to_record(item, repo_id, repo_name))
+                results.append(_item_to_record(item, repo_id, repo_name, activity))
         time.sleep(0.5)  # be polite between windows
 
     return results
@@ -223,6 +234,9 @@ def load_repos(parquet_path: str) -> list[tuple[int, str]]:
     return list(zip(df["repo_id"], df["repo_name"]))
 
 
+ACTIVITIES = ["Reviewed", "Authored"]
+
+
 def main():
     repos = load_repos(INPUT_PARQUET)
     print(f"Loaded {len(repos)} repos from {INPUT_PARQUET}")
@@ -230,37 +244,53 @@ def main():
     all_prs: list[dict] = []
     completed = 0
 
-    # Load existing output to support resuming
+    # Load existing output to support resuming.
+    # Track already-done (repo, activity) pairs so partial runs can resume.
+    already_done: set[tuple[str, str]] = set()
     if os.path.exists(OUTPUT_PARQUET):
         existing_df = pd.read_parquet(OUTPUT_PARQUET)
+        # Back-compat: if old file lacks 'activity' column treat all as 'Reviewed'
+        if "activity" not in existing_df.columns:
+            existing_df["activity"] = "Reviewed"
         all_prs = existing_df.to_dict("records")
-        already_done = set(existing_df["repo"].unique())
-        repos = [(rid, r) for rid, r in repos if r not in already_done]
-        print(f"Resuming: {len(already_done)} repos already processed, {len(repos)} remaining.")
+        already_done = set(zip(existing_df["repo"], existing_df["activity"]))
+        print(f"Resuming: {len(already_done)} (repo, activity) pairs already processed.")
+
+    # Build work list: (repo_id, repo_name, activity) skipping completed pairs
+    work_items = [
+        (rid, repo, activity)
+        for rid, repo in repos
+        for activity in ACTIVITIES
+        if (repo, activity) not in already_done
+    ]
+    print(f"{len(work_items)} (repo, activity) pairs remaining.")
 
     lock = threading.Lock()
 
-    def process_repo(repo_id: int, repo_name: str):
+    def process_repo(repo_id: int, repo_name: str, activity: str):
         nonlocal completed
-        print(f"Searching PRs: {repo_name}")
-        prs = search_prs_for_repo(repo_id, repo_name)
-        print(f"  -> {len(prs)} PRs found for {repo_name}")
+        print(f"Searching PRs [{activity}]: {repo_name}")
+        prs = search_prs_for_repo(repo_id, repo_name, activity)
+        print(f"  -> {len(prs)} PRs found for {repo_name} [{activity}]")
         with lock:
             all_prs.extend(prs)
             completed += 1
-            # Save incrementally every 10 repos
+            # Save incrementally every 10 work items
             if completed % 10 == 0:
                 pd.DataFrame(all_prs).to_parquet(OUTPUT_PARQUET, index=False)
                 print(f"  [checkpoint] Saved {len(all_prs)} PRs so far.")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_repo, rid, repo): repo for rid, repo in repos}
+        futures = {
+            executor.submit(process_repo, rid, repo, activity): (repo, activity)
+            for rid, repo, activity in work_items
+        }
         for future in as_completed(futures):
-            repo = futures[future]
+            repo, activity = futures[future]
             try:
                 future.result()
             except Exception as e:
-                print(f"  Error processing {repo}: {e}")
+                print(f"  Error processing {repo} [{activity}]: {e}")
 
     # Final save
     pd.DataFrame(all_prs).to_parquet(OUTPUT_PARQUET, index=False)

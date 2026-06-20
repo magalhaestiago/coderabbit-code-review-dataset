@@ -9,13 +9,13 @@ Requires GITHUB_TOKEN_1 (and optionally GITHUB_TOKEN_2) in .env.
 """
 
 import base64
-import csv
 import json
 import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+import pandas as pd
 
 import requests
 from dotenv import load_dotenv
@@ -26,9 +26,9 @@ load_dotenv()
 # Configuration
 # ---------------------------------------------------------------------------
 
-INPUT_CSV = "coderabbit_results.csv"
-OUTPUT_DIR = Path("configs")
-PROGRESS_JSONL = "progress_download.jsonl"
+INPUT_CSV = "results/repositories.parquet"
+OUTPUT_DIR = Path("results/repos_coderabbit_config_files")
+PROGRESS_JSONL = "results/progress_download.jsonl"
 MAX_WORKERS = 10
 
 TARGETS = [
@@ -47,10 +47,11 @@ TARGETS = [
 GITHUB_TOKEN_1 = os.environ.get("GITHUB_TOKEN_1", "")
 GITHUB_TOKEN_2 = os.environ.get("GITHUB_TOKEN_2", "")
 GITHUB_TOKEN_3 = os.environ.get("GITHUB_TOKEN_3", "")
+GITHUB_TOKEN_4 = os.environ.get("GITHUB_TOKEN_4", "")
 
-_tokens = [t for t in [GITHUB_TOKEN_1, GITHUB_TOKEN_2, GITHUB_TOKEN_3] if t]
+_tokens = [t for t in [GITHUB_TOKEN_1, GITHUB_TOKEN_2, GITHUB_TOKEN_3, GITHUB_TOKEN_4] if t]
 if not _tokens:
-    print("Warning: no GITHUB_TOKEN_1 / GITHUB_TOKEN_2 / GITHUB_TOKEN_3 set — unauthenticated (60 req/hr limit).")
+    print("Warning: no GITHUB_TOKEN_1 / GITHUB_TOKEN_2 / GITHUB_TOKEN_3 / GITHUB_TOKEN_4 set — unauthenticated (60 req/hr limit).")
 
 _token_lock = threading.Lock()
 _current_token_index = 0
@@ -143,15 +144,14 @@ def main():
     start_time = time.time()
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    # Read repos that have a config and note which targets were found
-    with open(INPUT_CSV, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        repos = []
-        for row in reader:
-            if row.get("has_coderabbit_config", "").strip().lower() != "true":
-                continue
-            found_targets = [t for t in TARGETS if row.get(t, "").strip().lower() == "true"]
-            repos.append((row["repo_name"], found_targets))
+    # Read repos that have a config file (detected via heuristic = "Configuration File")
+    df = pd.read_parquet(INPUT_CSV)
+    repos = []
+    for _, row in df.iterrows():
+        if str(row.get("heuristic", "")).strip() != "Configuration File":
+            continue
+        # Specific filename not stored; try all known targets at download time
+        repos.append((row["repo_name"], TARGETS))
 
     print(f"Repos to download: {len(repos)}")
 

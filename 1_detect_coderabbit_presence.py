@@ -7,7 +7,7 @@ Check which repos in repos.csv contain CodeRabbit configuration files or directo
   .coderabbit/
 
 Additional heuristics:
-  - branches with prefix "coderabbit/"  -> heuristic = "Branch"
+  - branches with prefix "coderabbit/" or "coderabbitai/"  -> heuristic = "Branch"
   - commits with git author name containing "coderabbit" -> heuristic = "Author"
 
 Outputs repositories.parquet with repo metadata (language, license, stars, forks, etc.).
@@ -37,8 +37,8 @@ TARGETS = [
 ]
 
 INPUT_CSV = "ai_config/repos.csv"
-OUTPUT_PARQUET = "repositories.parquet"
-PROGRESS_JSONL = "progress.jsonl"
+OUTPUT_PARQUET = "results/repositories.parquet"
+PROGRESS_JSONL = "results/progress.jsonl"
 MAX_WORKERS = 5 
 
 GITHUB_TOKEN_1 = os.environ.get("GITHUB_TOKEN_1", "")
@@ -113,37 +113,40 @@ def _parse_last_link(link_header: str) -> str | None:
 
 
 def _check_coderabbit_branches(owner_repo: str) -> bool:
-    """Return True if any 'coderabbit/' branch exists."""
-    url = f"https://api.github.com/repos/{owner_repo}/git/matching-refs/heads/coderabbit/"
-    token_index = _current_token_index
-    for attempt in range(6):
-        token = _tokens[token_index] if _tokens else ""
-        try:
-            response = requests.get(url, headers=_headers_for(token), timeout=15)
-        except requests.exceptions.ConnectTimeout:
-            wait = 10 * (attempt + 1)
-            print(f"  Connection timed out (attempt {attempt + 1}). Retrying in {wait}s...")
-            time.sleep(wait)
-            continue
-        except requests.exceptions.RequestException as e:
-            print(f"  Request error for {owner_repo} (branches): {e}")
-            return False
-        if response.status_code == 200:
-            return len(response.json()) > 0
-        elif response.status_code == 404:
-            return False
-        elif response.status_code == 403:
-            remaining = int(response.headers.get("X-RateLimit-Remaining", 0))
-            if remaining == 0 and len(_tokens) > 1:
-                token_index = _rotate_token(token_index)
-            else:
-                reset = int(response.headers.get("X-RateLimit-Reset", time.time() + 60))
-                wait = max(reset - int(time.time()), 1)
-                print(f"  Rate limited. Waiting {wait}s...")
+    """Return True if any 'coderabbit/' or 'coderabbitai/' branch exists."""
+    for prefix in ("coderabbit", "coderabbitai"):
+        url = f"https://api.github.com/repos/{owner_repo}/git/matching-refs/heads/{prefix}/"
+        token_index = _current_token_index
+        for attempt in range(6):
+            token = _tokens[token_index] if _tokens else ""
+            try:
+                response = requests.get(url, headers=_headers_for(token), timeout=15)
+            except requests.exceptions.ConnectTimeout:
+                wait = 10 * (attempt + 1)
+                print(f"  Connection timed out (attempt {attempt + 1}). Retrying in {wait}s...")
                 time.sleep(wait)
-        else:
-            print(f"  Unexpected status {response.status_code} for {owner_repo} (branches)")
-            return False
+                continue
+            except requests.exceptions.RequestException as e:
+                print(f"  Request error for {owner_repo} (branches): {e}")
+                break
+            if response.status_code == 200:
+                if len(response.json()) > 0:
+                    return True
+                break  # no matches for this prefix, try next
+            elif response.status_code == 404:
+                break  # try next prefix
+            elif response.status_code == 403:
+                remaining = int(response.headers.get("X-RateLimit-Remaining", 0))
+                if remaining == 0 and len(_tokens) > 1:
+                    token_index = _rotate_token(token_index)
+                else:
+                    reset = int(response.headers.get("X-RateLimit-Reset", time.time() + 60))
+                    wait = max(reset - int(time.time()), 1)
+                    print(f"  Rate limited. Waiting {wait}s...")
+                    time.sleep(wait)
+            else:
+                print(f"  Unexpected status {response.status_code} for {owner_repo} (branches)")
+                break  # try next prefix
     return False
 
 
@@ -275,7 +278,7 @@ def _get_pagination_count(owner_repo: str, endpoint: str, extra_params: dict | N
 
 
 def check_repo(repo_id: int, repo: str) -> dict:
-    mining_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    mined_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     root_names = _get_root_tree(repo)
     has_config = any(target in root_names for target in TARGETS) if root_names is not None else False
     if has_config:
@@ -294,7 +297,7 @@ def check_repo(repo_id: int, repo: str) -> dict:
         "repo_id": repo_id,
         "repo_name": repo,
         "heuristic": heuristic,
-        "mining_at": mining_at,
+        "mined_at": mined_at,
         "github_link": f"https://github.com/{repo}",
         "language": meta.get("language"),
         "license": meta.get("license"),
@@ -369,7 +372,7 @@ def main():
     positive = [r for r in results if r.get("heuristic")]
 
     columns = [
-        "repo_id", "repo_name", "heuristic", "mining_at", "github_link",
+        "repo_id", "repo_name", "heuristic", "mined_at", "github_link",
         "language", "license", "created_at", "commits",
         "forks", "watchers", "stargazers", "contributors", "topics",
     ]

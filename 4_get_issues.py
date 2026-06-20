@@ -1,40 +1,40 @@
 """
-For each repo in coderabbit_results.csv, search GitHub for closed issues that mention
-CodeRabbit using the query: is:issue is:closed coderabbit repo:<owner>/<repo>
+For each repo in repositories.parquet, search GitHub for closed issues commented on by
+coderabbitai[bot] using the query: is:issue is:closed commenter:coderabbitai[bot] repo:<owner>/<repo>
 
 To overcome GitHub's 1000-result cap per query, the search is split into
 monthly time windows using the `closed:` qualifier. If a month still reports
 >1000 results it is split into weekly windows recursively, ensuring complete
 coverage regardless of issue volume.
 
-Outputs issue_links.json with issue link and metadata (author, title, dates, etc.).
+Outputs issues.parquet with issue metadata and repo_id foreign key linking to repositories.parquet.
 
 Set GITHUB_TOKEN_1 / _2 / _3 env variables to avoid rate limiting.
 """
 
-import csv
-import json
 import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 
+import pandas as pd
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-INPUT_CSV = "coderabbit_results.csv"
-OUTPUT_JSON = "issue_links.json"
+INPUT_PARQUET = "results/repositories.parquet"
+OUTPUT_PARQUET = "results/issues.parquet"
 MAX_WORKERS = 3  # search API is stricter on rate limits
 PER_PAGE = 100   # max allowed by GitHub search API
 
 GITHUB_TOKEN_1 = os.environ.get("GITHUB_TOKEN_1", "")
 GITHUB_TOKEN_2 = os.environ.get("GITHUB_TOKEN_2", "")
 GITHUB_TOKEN_3 = os.environ.get("GITHUB_TOKEN_3", "")
+GITHUB_TOKEN_4 = os.environ.get("GITHUB_TOKEN_4", "")
 
-_tokens = [t for t in [GITHUB_TOKEN_1, GITHUB_TOKEN_2, GITHUB_TOKEN_3] if t]
+_tokens = [t for t in [GITHUB_TOKEN_1, GITHUB_TOKEN_2, GITHUB_TOKEN_3, GITHUB_TOKEN_4] if t]
 if not _tokens:
     print("Warning: no GITHUB_TOKEN set — unauthenticated (10 req/min search limit).")
 
@@ -162,8 +162,9 @@ def _search_window(base_query: str, start: date, end: date, repo_name: str) -> l
     return _fetch_window(query)
 
 
-def _item_to_record(item: dict, repo_name: str) -> dict:
+def _item_to_record(item: dict, repo_id: int, repo_name: str) -> dict:
     return {
+        "repo_id": repo_id,
         "repo": repo_name,
         "issue_number": item.get("number"),
         "title": item.get("title"),
@@ -178,13 +179,13 @@ def _item_to_record(item: dict, repo_name: str) -> dict:
     }
 
 
-def search_issues_for_repo(repo_name: str) -> list[dict]:
+def search_issues_for_repo(repo_id: int, repo_name: str) -> list[dict]:
     """
-    Search closed issues mentioning coderabbit for a single repo.
+    Search closed issues commented on by coderabbitai[bot] for a single repo.
     Uses monthly time windows with recursive bisection to stay under
     GitHub's 1000-result-per-query cap.
     """
-    base_query = f"is:issue is:closed coderabbit repo:{repo_name}"
+    base_query = f"is:issue is:closed commenter:coderabbitai[bot] repo:{repo_name}"
 
     # First check total without date filter
     total = _count_window(base_query)
@@ -196,7 +197,7 @@ def search_issues_for_repo(repo_name: str) -> list[dict]:
     if total < RESULT_CAP:
         # Simple case: fetch all at once
         items = _fetch_window(base_query)
-        return [_item_to_record(i, repo_name) for i in items]
+        return [_item_to_record(i, repo_id, repo_name) for i in items]
 
     # Split by month from GitHub's launch (2023-01) up to today
     start = date(2023, 1, 1)
@@ -212,56 +213,49 @@ def search_issues_for_repo(repo_name: str) -> list[dict]:
             issue_id = item.get("number")
             if issue_id not in seen_ids:
                 seen_ids.add(issue_id)
-                results.append(_item_to_record(item, repo_name))
+                results.append(_item_to_record(item, repo_id, repo_name))
         time.sleep(0.5)  # be polite between windows
 
     return results
 
 
-def load_repos(csv_path: str) -> list[str]:
-    repos = []
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            repo = row.get("repo_name", "").strip()
-            if repo:
-                repos.append(repo)
-    return repos
+def load_repos(parquet_path: str) -> list[tuple[int, str]]:
+    df = pd.read_parquet(parquet_path, columns=["repo_id", "repo_name"])
+    return list(zip(df["repo_id"], df["repo_name"]))
 
 
 def main():
-    repos = load_repos(INPUT_CSV)
-    print(f"Loaded {len(repos)} repos from {INPUT_CSV}")
+    repos = load_repos(INPUT_PARQUET)
+    print(f"Loaded {len(repos)} repos from {INPUT_PARQUET}")
 
     all_issues: list[dict] = []
     completed = 0
 
     # Load existing output to support resuming
-    if os.path.exists(OUTPUT_JSON):
-        with open(OUTPUT_JSON, encoding="utf-8") as f:
-            all_issues = json.load(f)
-        already_done = {issue["repo"] for issue in all_issues}
-        repos = [r for r in repos if r not in already_done]
+    if os.path.exists(OUTPUT_PARQUET):
+        existing_df = pd.read_parquet(OUTPUT_PARQUET)
+        all_issues = existing_df.to_dict("records")
+        already_done = set(existing_df["repo"].unique())
+        repos = [(rid, r) for rid, r in repos if r not in already_done]
         print(f"Resuming: {len(already_done)} repos already processed, {len(repos)} remaining.")
 
     lock = threading.Lock()
 
-    def process_repo(repo_name: str):
+    def process_repo(repo_id: int, repo_name: str):
         nonlocal completed
         print(f"Searching issues: {repo_name}")
-        issues = search_issues_for_repo(repo_name)
+        issues = search_issues_for_repo(repo_id, repo_name)
         print(f"  -> {len(issues)} issues found for {repo_name}")
         with lock:
             all_issues.extend(issues)
             completed += 1
             # Save incrementally every 10 repos
             if completed % 10 == 0:
-                with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
-                    json.dump(all_issues, f, indent=2, ensure_ascii=False)
+                pd.DataFrame(all_issues).to_parquet(OUTPUT_PARQUET, index=False)
                 print(f"  [checkpoint] Saved {len(all_issues)} issues so far.")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_repo, repo): repo for repo in repos}
+        futures = {executor.submit(process_repo, rid, repo): repo for rid, repo in repos}
         for future in as_completed(futures):
             repo = futures[future]
             try:
@@ -270,10 +264,9 @@ def main():
                 print(f"  Error processing {repo}: {e}")
 
     # Final save
-    with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
-        json.dump(all_issues, f, indent=2, ensure_ascii=False)
+    pd.DataFrame(all_issues).to_parquet(OUTPUT_PARQUET, index=False)
 
-    print(f"\nDone. {len(all_issues)} total issues saved to {OUTPUT_JSON}")
+    print(f"\nDone. {len(all_issues)} total issues saved to {OUTPUT_PARQUET}")
 
 
 if __name__ == "__main__":
