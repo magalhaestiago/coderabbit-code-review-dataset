@@ -44,10 +44,11 @@ MAX_WORKERS = 5
 GITHUB_TOKEN_1 = os.environ.get("GITHUB_TOKEN_1", "")
 GITHUB_TOKEN_2 = os.environ.get("GITHUB_TOKEN_2", "")
 GITHUB_TOKEN_3 = os.environ.get("GITHUB_TOKEN_3", "")
+GITHUB_TOKEN_4 = os.environ.get("GITHUB_TOKEN_4", "")
 
-_tokens = [t for t in [GITHUB_TOKEN_1, GITHUB_TOKEN_2, GITHUB_TOKEN_3] if t]
+_tokens = [t for t in [GITHUB_TOKEN_1, GITHUB_TOKEN_2, GITHUB_TOKEN_3, GITHUB_TOKEN_4] if t]
 if not _tokens:
-    print("Warning: no GITHUB_TOKEN_1 / GITHUB_TOKEN_2 / GITHUB_TOKEN_3 set — unauthenticated (60 req/hr limit).")
+    print("Warning: no GITHUB_TOKEN_1 / GITHUB_TOKEN_2 / GITHUB_TOKEN_3 / GITHUB_TOKEN_4 set — unauthenticated (60 req/hr limit).")
 
 _token_lock = threading.Lock()
 _current_token_index = 0
