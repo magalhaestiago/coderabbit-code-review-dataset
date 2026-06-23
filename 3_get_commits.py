@@ -1,10 +1,12 @@
 """
-For each repo in repositories.parquet, fetch all commits authored by
-coderabbitai[bot] via the GitHub REST API:
-  GET /repos/{owner}/{repo}/commits?author=coderabbitai[bot]
+For each unique PR in pull_requests.parquet, fetch all commits via the
+GitHub REST API:
+  GET /repos/{owner}/{repo}/pulls/{pr_number}/commits
 
-Outputs results/commits.parquet with commit metadata and a repo_id foreign
-key linking back to results/repositories.parquet.
+Only commits where author.login == "coderabbitai[bot]" are kept.
+
+Outputs results/commits.parquet with commit metadata and foreign keys
+linking back to results/repositories.parquet and results/pull_requests.parquet.
 
 Set GITHUB_TOKEN_1 / _2 / _3 / _4 env variables to avoid rate limiting.
 """
@@ -21,7 +23,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-INPUT_PARQUET = "results/repositories.parquet"
+INPUT_PARQUET = "results/pull_requests.parquet"
 OUTPUT_PARQUET = "results/commits.parquet"
 MAX_WORKERS = 5
 PER_PAGE = 100
@@ -81,7 +83,7 @@ API_BASE = "https://api.github.com"
 
 # Ordered: first match wins.
 _COMMIT_TYPE_PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("autofix",                  re.compile(r'\bautofix\b|\bauto[\s_-]?fix\b', re.IGNORECASE)),
+    ("autofix",                  re.compile(r'\bautofix(es)?\b|\bauto[\s_-]?fix(es)?\b', re.IGNORECASE)),
     ("generate unit tests",      re.compile(r'\bgenerate\s+unit[\s_-]?tests?\b|\bunit[\s_-]?tests?\b|\badd\s+unit\b', re.IGNORECASE)),
     ("generate docstrings",      re.compile(r'\bgenerate\s+docstrings?\b|\bdocstrings?\b|\badd\s+docs?\b', re.IGNORECASE)),
     ("resolve merge conflicts",  re.compile(r'\bresolve\s+merge[\s_-]?conflicts?\b|\bmerge[\s_-]?conflicts?\b', re.IGNORECASE)),
@@ -100,34 +102,35 @@ def classify_commit(message: str) -> str:
     return "Other"
 
 
-def _item_to_record(item: dict, repo_id: int, repo_name: str) -> dict:
+def _item_to_record(item: dict, repo_id: int, repo_name: str, pr_id: str, pr_number: int) -> dict | None:
+    """Return a record only if the commit was authored by coderabbitai[bot]."""
+    gh_author = item.get("author") or {}
+    if gh_author.get("login") != "coderabbitai[bot]":
+        return None
     commit = item.get("commit", {})
     author = commit.get("author", {})
-    committer = commit.get("committer", {})
     return {
         "repo_id": repo_id,
         "repo": repo_name,
+        "pr_id": pr_id,
+        "pr_number": pr_number,
         "sha": item.get("sha"),
         "message": commit.get("message"),
         "commit_activity_type": classify_commit(commit.get("message", "")),
         "author_name": author.get("name"),
-        "author_email": author.get("email"),
         "author_date": author.get("date"),
-        "committer_name": committer.get("name"),
-        "committer_email": committer.get("email"),
-        "committer_date": committer.get("date"),
         "url": item.get("html_url"),
     }
 
 
-def fetch_commits_for_repo(repo_id: int, repo_name: str) -> list[dict]:
-    """Fetch all commits authored by coderabbitai[bot] for a repo (paginated)."""
-    url = f"{API_BASE}/repos/{repo_name}/commits"
+def fetch_commits_for_pr(repo_id: int, repo_name: str, pr_id: str, pr_number: int) -> list[dict]:
+    """Fetch all commits for a PR authored by coderabbitai[bot] (paginated)."""
+    url = f"{API_BASE}/repos/{repo_name}/pulls/{pr_number}/commits"
     results = []
     page = 1
 
     while True:
-        resp = _get(url, params={"author": "coderabbitai[bot]", "per_page": PER_PAGE, "page": page})
+        resp = _get(url, params={"per_page": PER_PAGE, "page": page})
         if resp is None:
             break
 
@@ -136,7 +139,9 @@ def fetch_commits_for_repo(repo_id: int, repo_name: str) -> list[dict]:
             break
 
         for i in items:
-            results.append(_item_to_record(i, repo_id, repo_name))
+            record = _item_to_record(i, repo_id, repo_name, pr_id, pr_number)
+            if record:
+                results.append(record)
 
         if len(items) < PER_PAGE:
             break
@@ -147,56 +152,103 @@ def fetch_commits_for_repo(repo_id: int, repo_name: str) -> list[dict]:
     return results
 
 
-def load_repos(parquet_path: str) -> list[tuple[int, str]]:
-    df = pd.read_parquet(parquet_path, columns=["repo_id", "repo_name"])
-    return list(zip(df["repo_id"], df["repo_name"]))
+def load_prs(parquet_path: str) -> list[tuple[int, str, str, int]]:
+    df = pd.read_parquet(parquet_path, columns=["repo_id", "repo", "pr_number", "pr_id"])
+    unique = df.drop_duplicates(subset=["repo", "pr_number"])
+    return list(zip(unique["repo_id"], unique["repo"], unique["pr_id"], unique["pr_number"]))
 
 
 def main():
-    repos = load_repos(INPUT_PARQUET)
-    print(f"Loaded {len(repos)} repos from {INPUT_PARQUET}")
+    prs = load_prs(INPUT_PARQUET)
+    print(f"Loaded {len(prs)} authored PRs from {INPUT_PARQUET}")
 
     all_commits: list[dict] = []
     completed = 0
 
-    # Load existing output to support resuming — track repo names already processed
-    already_done: set[str] = set()
+    # Load existing output to support resuming — track PR keys already processed
+    already_done: set[tuple] = set()
     if os.path.exists(OUTPUT_PARQUET):
         existing_df = pd.read_parquet(OUTPUT_PARQUET)
         all_commits = existing_df.to_dict("records")
-        already_done = set(existing_df["repo"].unique())
-        repos = [(rid, repo) for rid, repo in repos if repo not in already_done]
-        print(f"Resuming: {len(already_done)} repos already processed, {len(repos)} remaining.")
+        already_done = set(zip(existing_df["repo"], existing_df["pr_number"]))
+        prs = [(rid, repo, pr_id, pr) for rid, repo, pr_id, pr in prs if (repo, pr) not in already_done]
+        print(f"Resuming: {len(already_done)} PRs already processed, {len(prs)} remaining.")
 
     lock = threading.Lock()
 
-    def process_repo(repo_id: int, repo_name: str):
+    def process_pr(repo_id: int, repo_name: str, pr_id: str, pr_number: int):
         nonlocal completed
-        print(f"Fetching commits: {repo_name}")
-        commits = fetch_commits_for_repo(repo_id, repo_name)
-        print(f"  -> {len(commits)} commits for {repo_name}")
+        print(f"Fetching commits: {repo_name}#{pr_number} (pr_id={pr_id})")
+        commits = fetch_commits_for_pr(repo_id, repo_name, pr_id, pr_number)
+        print(f"  -> {len(commits)} commits for {repo_name}#{pr_number}")
         with lock:
             all_commits.extend(commits)
             completed += 1
-            if completed % 50 == 0:
+            if completed % 20 == 0:
                 pd.DataFrame(all_commits).to_parquet(OUTPUT_PARQUET, index=False)
                 print(f"  [checkpoint] Saved {len(all_commits)} commits so far.")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
-            executor.submit(process_repo, rid, repo): repo
-            for rid, repo in repos
+            executor.submit(process_pr, rid, repo, pr_id, pr): (repo, pr)
+            for rid, repo, pr_id, pr in prs
         }
         for future in as_completed(futures):
-            repo = futures[future]
+            key = futures[future]
             try:
                 future.result()
             except Exception as e:
-                print(f"  Error processing {repo}: {e}")
+                print(f"  Error processing {key}: {e}")
 
     final_df = pd.DataFrame(all_commits)
     final_df.to_parquet(OUTPUT_PARQUET, index=False)
-    print(f"\nDone. {len(all_commits)} total commits saved to {OUTPUT_PARQUET}")
+    print(f"\nDone. {len(all_commits)} commits saved to {OUTPUT_PARQUET}")
+
+    # --- Enrich pull_requests.parquet with commit activity types ---
+    print("\nEnriching pull_requests.parquet with commit activity types...")
+    pr_df = pd.read_parquet(INPUT_PARQUET)
+
+    # Use the full commits.parquet for enrichment (covers resumed runs too)
+    full_commits_df = pd.read_parquet(OUTPUT_PARQUET, columns=["pr_id", "commit_activity_type"])
+    commit_types = (
+        full_commits_df
+        .groupby("pr_id")["commit_activity_type"]
+        .apply(lambda x: sorted(set(x)))
+        .reset_index()
+        .rename(columns={"commit_activity_type": "commit_types"})
+    )
+
+    pr_df = pr_df.merge(commit_types, on="pr_id", how="left")
+
+    def build_activity_list(row):
+        base = row["coderabbit_activity"]
+        base_list = list(base) if hasattr(base, "__iter__") and not isinstance(base, str) else [base]
+        # strip any already-flattened string (re-entrancy safe)
+        if len(base_list) == 1 and ":" in base_list[0]:
+            base_list = [base_list[0].split(":")[0].split(",")[0].strip()]
+        extra = list(row["commit_types"]) if isinstance(row["commit_types"], (list, tuple)) else []
+        combined = base_list + [t for t in extra if t not in base_list]
+        if combined == ["Authored"]:
+            combined = ["Authored", "Other"]
+        return combined
+
+    def flatten_activity(value) -> str:
+        items = list(value) if hasattr(value, "__iter__") and not isinstance(value, str) else [str(value)]
+        if not items:
+            return ""
+        first = items[0]
+        rest = items[1:]
+        if rest:
+            authored_part = ", ".join(rest)
+            return f"Reviewed, Authored: {authored_part}" if first == "Reviewed" else f"{first}: {authored_part}"
+        return first
+
+    pr_df["coderabbit_activity"] = pr_df.apply(build_activity_list, axis=1).apply(flatten_activity)
+    pr_df = pr_df.drop(columns=["commit_types"])
+    pr_df.to_parquet(INPUT_PARQUET, index=False)
+
+    print(f"Updated {INPUT_PARQUET}")
+    print(pr_df["coderabbit_activity"].value_counts().head(20))
 
 
 if __name__ == "__main__":

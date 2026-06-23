@@ -283,21 +283,21 @@ def check_repo(repo_id: int, repo: str) -> dict:
     root_names = _get_root_tree(repo)
     has_config = any(target in root_names for target in TARGETS) if root_names is not None else False
     if has_config:
-        heuristic = "Configuration File"
+        coderabbit_detection_heuristic = "Configuration File"
     else:
         if _check_coderabbit_branches(repo):
-            heuristic = "Branch"
+            coderabbit_detection_heuristic = "Branch"
         elif _check_coderabbit_author(repo):
-            heuristic = "Author"
+            coderabbit_detection_heuristic = "Author"
         else:
-            heuristic = None
+            coderabbit_detection_heuristic = None
     meta = _get_repo_metadata(repo)
     commits = _get_pagination_count(repo, "commits")
     contributors = _get_pagination_count(repo, "contributors", {"anon": "1"})
     return {
         "repo_id": repo_id,
         "repo_name": repo,
-        "heuristic": heuristic,
+        "coderabbit_detection_heuristic": coderabbit_detection_heuristic,
         "mined_at": mined_at,
         "github_link": f"https://github.com/{repo}",
         "language": meta.get("language"),
@@ -358,7 +358,7 @@ def main():
                     progress_file.write(json.dumps(row) + "\n")
                     progress_file.flush()
                     elapsed = time.time() - start_time
-                    found_label = f" [{row['heuristic']}]" if row["heuristic"] else ""
+                    found_label = f" [{row['coderabbit_detection_heuristic']}]" if row["coderabbit_detection_heuristic"] else ""
                     avg = elapsed / completed_count
                     eta = avg * (total - i)
                     print(f"[{i}/{total}] {repo}{found_label}")
@@ -370,10 +370,10 @@ def main():
     repo_order = {r: idx for idx, (_, r) in enumerate(repos)}
     results.sort(key=lambda r: repo_order.get(r["repo_name"], 0))
 
-    positive = [r for r in results if r.get("heuristic")]
+    positive = [r for r in results if r.get("coderabbit_detection_heuristic")]
 
     columns = [
-        "repo_id", "repo_name", "heuristic", "mined_at", "github_link",
+        "repo_id", "repo_name", "coderabbit_detection_heuristic", "mined_at", "github_link",
         "language", "license", "created_at", "commits",
         "forks", "watchers", "stargazers", "contributors", "topics",
     ]

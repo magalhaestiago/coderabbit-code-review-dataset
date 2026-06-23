@@ -165,10 +165,12 @@ def _search_window(base_query: str, start: date, end: date, repo_name: str) -> l
 
 
 def _item_to_record(item: dict, repo_id: int, repo_name: str, coderabbit_activity: str) -> dict:
+    pr_number = item.get("number")
     return {
         "repo_id": repo_id,
         "repo": repo_name,
-        "pr_number": item.get("number"),
+        "pr_id": f"{repo_id}_{pr_number}",
+        "pr_number": pr_number,
         "title": item.get("title"),
         "url": item.get("html_url"),
         "state": item.get("state"),

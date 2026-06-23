@@ -27,7 +27,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 INPUT_CSV = "results/repositories.parquet"
-OUTPUT_DIR = Path("results/repos_coderabbit_config_files")
+OUTPUT_DIR = Path("results/coderabbit_configuration_files")
 PROGRESS_JSONL = "results/progress_download.jsonl"
 MAX_WORKERS = 10
 
@@ -148,7 +148,7 @@ def main():
     df = pd.read_parquet(INPUT_CSV)
     repos = []
     for _, row in df.iterrows():
-        if str(row.get("heuristic", "")).strip() != "Configuration File":
+        if str(row.get("coderabbit_method_heuristic", "")).strip() != "Configuration File":
             continue
         # Specific filename not stored; try all known targets at download time
         repos.append((row["repo_name"], TARGETS))
