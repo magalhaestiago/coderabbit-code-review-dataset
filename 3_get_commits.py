@@ -82,24 +82,67 @@ def _get(url: str, params: dict = None, retries: int = 5) -> requests.Response |
 API_BASE = "https://api.github.com"
 
 # Ordered: first match wins.
-_COMMIT_TYPE_PATTERNS: list[tuple[str, re.Pattern]] = [
+_COMMIT_ACTIVITY_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("autofix",                  re.compile(r'\bautofix(es)?\b|\bauto[\s_-]?fix(es)?\b', re.IGNORECASE)),
-    ("generate unit tests",      re.compile(r'\bgenerate\s+unit[\s_-]?tests?\b|\bunit[\s_-]?tests?\b|\badd\s+unit\b', re.IGNORECASE)),
+    ("generate unit tests",      re.compile(r'\bgenerate\s+unit[\s_-]?tests?\b|\bunit[\s_-]?tests?\b|\badd\s+unit\b|\badd\s+pytest\s+tests?\b|\badd\s+.*test\s+files?\b|\bupdate\s+tests?[/\w.-]*|\bUTG\b', re.IGNORECASE)),
     ("generate docstrings",      re.compile(r'\bgenerate\s+docstrings?\b|\bdocstrings?\b|\badd\s+docs?\b', re.IGNORECASE)),
     ("resolve merge conflicts",  re.compile(r'\bresolve\s+merge[\s_-]?conflicts?\b|\bmerge[\s_-]?conflicts?\b', re.IGNORECASE)),
+    ("config update",            re.compile(r'\.coderabbit\.ya?ml|\bcoderabbit\s+config\b', re.IGNORECASE)),
+    ("style cleanup",            re.compile(r"\breplace\s+'?var'?\s+with\s+'?const'?\b|\blint\b|\bformat(ted|ting)?\b", re.IGNORECASE)),
     ("custom recipes",           re.compile(r'\bcustom[\s_-]?recipes?\b', re.IGNORECASE)),
     ("simplify code",            re.compile(r'\bsimplify[\s_-]?code\b|\bsimplif(y|ied|ication)\b', re.IGNORECASE)),
+    ("targeted code change",      re.compile(r'\bCodeRabbit\s+Chat:\s+(Update|Fix|Remove|Replace)\b|^(fix|feat|refactor|chore)(\(.+\))?:', re.IGNORECASE)),
+    ("apply requested changes",   re.compile(r'\bimplement\s+requested\s+code\s+changes\b|\bcode\s+changes\s+was\s+requested\b', re.IGNORECASE)),
+]
+
+_COMMIT_INTERACTION_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("CodeRabbit Chat requested change", re.compile(r'\bCodeRabbit\s+Chat:', re.IGNORECASE)),
+    ("autofix",                         re.compile(r'\bautofix(es)?\b|\bauto[\s_-]?fix(es)?\b', re.IGNORECASE)),
+    ("generated unit tests",            re.compile(r'\bgenerate\s+unit[\s_-]?tests?\b|\bunit[\s_-]?tests?\b|\bUTG\b', re.IGNORECASE)),
+    ("generated docstrings",            re.compile(r'\bgenerate\s+docstrings?\b|\bdocstrings?\b', re.IGNORECASE)),
 ]
 
 
-def classify_commit(message: str) -> str:
-    """Return the commit type for a coderabbitai commit message."""
+def classify_commit_activity(message: str) -> str:
+    """Return what kind of change the commit made."""
     if not message:
         return "Other"
-    for type_name, pattern in _COMMIT_TYPE_PATTERNS:
+    for type_name, pattern in _COMMIT_ACTIVITY_PATTERNS:
         if pattern.search(message):
             return type_name
     return "Other"
+
+
+def classify_commit_interaction(message: str) -> str:
+    """Return how the CodeRabbit commit appears to have been produced."""
+    if not message:
+        return "unknown"
+    for interaction_name, pattern in _COMMIT_INTERACTION_PATTERNS:
+        if pattern.search(message):
+            return interaction_name
+    return "unknown"
+
+
+def classify_commit(message: str) -> str:
+    """Return the commit activity type for backwards compatibility."""
+    return classify_commit_activity(message)
+
+
+def add_commit_classifications(record: dict) -> dict:
+    message = record.get("message", "")
+    record["commit_activity_type"] = classify_commit_activity(message)
+    record["commit_interaction_type"] = classify_commit_interaction(message)
+    return record
+
+
+def refresh_commit_classification_columns(df):
+    """Recompute classification columns for old or resumed commit datasets."""
+    if df.empty or "message" not in df.columns:
+        return df
+    messages = df["message"].fillna("")
+    df["commit_activity_type"] = messages.map(classify_commit_activity)
+    df["commit_interaction_type"] = messages.map(classify_commit_interaction)
+    return df
 
 
 def _item_to_record(item: dict, repo_id: int, repo_name: str, pr_id: str, pr_number: int) -> dict | None:
@@ -109,18 +152,17 @@ def _item_to_record(item: dict, repo_id: int, repo_name: str, pr_id: str, pr_num
         return None
     commit = item.get("commit", {})
     author = commit.get("author", {})
-    return {
+    return add_commit_classifications({
         "repo_id": repo_id,
         "repo": repo_name,
         "pr_id": pr_id,
         "pr_number": pr_number,
         "sha": item.get("sha"),
         "message": commit.get("message"),
-        "commit_activity_type": classify_commit(commit.get("message", "")),
         "author_name": author.get("name"),
         "author_date": author.get("date"),
         "url": item.get("html_url"),
-    }
+    })
 
 
 def fetch_commits_for_pr(repo_id: int, repo_name: str, pr_id: str, pr_number: int) -> list[dict]:
@@ -169,6 +211,7 @@ def main():
     already_done: set[tuple] = set()
     if os.path.exists(OUTPUT_PARQUET):
         existing_df = pd.read_parquet(OUTPUT_PARQUET)
+        existing_df = refresh_commit_classification_columns(existing_df)
         all_commits = existing_df.to_dict("records")
         already_done = set(zip(existing_df["repo"], existing_df["pr_number"]))
         prs = [(rid, repo, pr_id, pr) for rid, repo, pr_id, pr in prs if (repo, pr) not in already_done]
@@ -201,6 +244,7 @@ def main():
                 print(f"  Error processing {key}: {e}")
 
     final_df = pd.DataFrame(all_commits)
+    final_df = refresh_commit_classification_columns(final_df)
     final_df.to_parquet(OUTPUT_PARQUET, index=False)
     print(f"\nDone. {len(all_commits)} commits saved to {OUTPUT_PARQUET}")
 
@@ -253,4 +297,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
