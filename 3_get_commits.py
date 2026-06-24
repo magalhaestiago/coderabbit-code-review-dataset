@@ -23,8 +23,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-INPUT_PARQUET = "results/pull_requests.parquet"
-OUTPUT_PARQUET = "results/commits.parquet"
+INPUT_PARQUET = "results/pull_requests_sample.parquet"
+OUTPUT_PARQUET = "results/commits_sample.parquet"
 MAX_WORKERS = 5
 PER_PAGE = 100
 
@@ -95,13 +95,6 @@ _COMMIT_ACTIVITY_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("apply requested changes",   re.compile(r'\bimplement\s+requested\s+code\s+changes\b|\bcode\s+changes\s+was\s+requested\b', re.IGNORECASE)),
 ]
 
-_COMMIT_INTERACTION_PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("CodeRabbit Chat requested change", re.compile(r'\bCodeRabbit\s+Chat:', re.IGNORECASE)),
-    ("autofix",                         re.compile(r'\bautofix(es)?\b|\bauto[\s_-]?fix(es)?\b', re.IGNORECASE)),
-    ("generated unit tests",            re.compile(r'\bgenerate\s+unit[\s_-]?tests?\b|\bunit[\s_-]?tests?\b|\bUTG\b', re.IGNORECASE)),
-    ("generated docstrings",            re.compile(r'\bgenerate\s+docstrings?\b|\bdocstrings?\b', re.IGNORECASE)),
-]
-
 
 def classify_commit_activity(message: str) -> str:
     """Return what kind of change the commit made."""
@@ -113,16 +106,6 @@ def classify_commit_activity(message: str) -> str:
     return "Other"
 
 
-def classify_commit_interaction(message: str) -> str:
-    """Return how the CodeRabbit commit appears to have been produced."""
-    if not message:
-        return "unknown"
-    for interaction_name, pattern in _COMMIT_INTERACTION_PATTERNS:
-        if pattern.search(message):
-            return interaction_name
-    return "unknown"
-
-
 def classify_commit(message: str) -> str:
     """Return the commit activity type for backwards compatibility."""
     return classify_commit_activity(message)
@@ -131,7 +114,6 @@ def classify_commit(message: str) -> str:
 def add_commit_classifications(record: dict) -> dict:
     message = record.get("message", "")
     record["commit_activity_type"] = classify_commit_activity(message)
-    record["commit_interaction_type"] = classify_commit_interaction(message)
     return record
 
 
@@ -141,7 +123,6 @@ def refresh_commit_classification_columns(df):
         return df
     messages = df["message"].fillna("")
     df["commit_activity_type"] = messages.map(classify_commit_activity)
-    df["commit_interaction_type"] = messages.map(classify_commit_interaction)
     return df
 
 
