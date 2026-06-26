@@ -30,7 +30,6 @@ ENV/
 
 # Jupyter
 .ipynb_checkpoints/
-*.ipynb
 
 # pytest / coverage
 .pytest_cache/

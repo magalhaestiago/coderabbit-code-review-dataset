@@ -29,6 +29,22 @@ OUTPUT_PARQUET = "results/issues.parquet"
 MAX_WORKERS = 3  # search API is stricter on rate limits
 PER_PAGE = 100   # max allowed by GitHub search API
 
+ISSUE_COLUMNS = [
+    "repo_id",
+    "repo",
+    "issue_id",
+    "issue_number",
+    "title",
+    "url",
+    "state",
+    "author",
+    "created_at",
+    "updated_at",
+    "closed_at",
+    "labels",
+    "comments",
+]
+
 GITHUB_TOKEN_1 = os.environ.get("GITHUB_TOKEN_1", "")
 GITHUB_TOKEN_2 = os.environ.get("GITHUB_TOKEN_2", "")
 GITHUB_TOKEN_3 = os.environ.get("GITHUB_TOKEN_3", "")
@@ -163,10 +179,12 @@ def _search_window(base_query: str, start: date, end: date, repo_name: str) -> l
 
 
 def _item_to_record(item: dict, repo_id: int, repo_name: str) -> dict:
+    issue_number = item.get("number")
     return {
         "repo_id": repo_id,
         "repo": repo_name,
-        "issue_number": item.get("number"),
+        "issue_id": f"{repo_id}_{issue_number}",
+        "issue_number": issue_number,
         "title": item.get("title"),
         "url": item.get("html_url"),
         "state": item.get("state"),
@@ -177,6 +195,12 @@ def _item_to_record(item: dict, repo_id: int, repo_name: str) -> dict:
         "labels": [lbl.get("name") for lbl in item.get("labels", [])],
         "comments": item.get("comments"),
     }
+
+
+def _normalize_issue_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if "issue_id" not in df.columns:
+        df["issue_id"] = df["repo_id"].astype(str) + "_" + df["issue_number"].astype(str)
+    return df.reindex(columns=ISSUE_COLUMNS)
 
 
 def search_issues_for_repo(repo_id: int, repo_name: str) -> list[dict]:
@@ -234,6 +258,7 @@ def main():
     # Load existing output to support resuming
     if os.path.exists(OUTPUT_PARQUET):
         existing_df = pd.read_parquet(OUTPUT_PARQUET)
+        existing_df = _normalize_issue_columns(existing_df)
         all_issues = existing_df.to_dict("records")
         already_done = set(existing_df["repo"].unique())
         repos = [(rid, r) for rid, r in repos if r not in already_done]
@@ -251,7 +276,7 @@ def main():
             completed += 1
             # Save incrementally every 10 repos
             if completed % 10 == 0:
-                pd.DataFrame(all_issues).to_parquet(OUTPUT_PARQUET, index=False)
+                pd.DataFrame(all_issues, columns=ISSUE_COLUMNS).to_parquet(OUTPUT_PARQUET, index=False)
                 print(f"  [checkpoint] Saved {len(all_issues)} issues so far.")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -264,7 +289,7 @@ def main():
                 print(f"  Error processing {repo}: {e}")
 
     # Final save
-    pd.DataFrame(all_issues).to_parquet(OUTPUT_PARQUET, index=False)
+    pd.DataFrame(all_issues, columns=ISSUE_COLUMNS).to_parquet(OUTPUT_PARQUET, index=False)
 
     print(f"\nDone. {len(all_issues)} total issues saved to {OUTPUT_PARQUET}")
 

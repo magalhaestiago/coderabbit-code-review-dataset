@@ -179,7 +179,7 @@ def _item_to_record(item: dict, repo_id: int, repo_name: str, coderabbit_activit
         "updated_at": item.get("updated_at"),
         "closed_at": item.get("closed_at"),
         "labels": [lbl.get("name") for lbl in item.get("labels", [])],
-        "comments": item.get("comments"),
+        "number_comments": item.get("comments"),
         "coderabbit_activity": coderabbit_activity,
     }
 
@@ -249,6 +249,8 @@ def main():
     already_done: set[tuple[str, str]] = set()
     if os.path.exists(OUTPUT_PARQUET):
         existing_df = pd.read_parquet(OUTPUT_PARQUET)
+        if "comments" in existing_df.columns and "number_comments" not in existing_df.columns:
+            existing_df = existing_df.rename(columns={"comments": "number_comments"})
         # Back-compat: if old file lacks 'coderabbit_activity' column treat all as 'Reviewed'
         if "coderabbit_activity" not in existing_df.columns:
             existing_df["coderabbit_activity"] = "Reviewed"

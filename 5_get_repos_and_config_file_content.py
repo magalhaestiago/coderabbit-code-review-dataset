@@ -1,6 +1,6 @@
 """
-For every repo in coderabbit_results.csv that has a CodeRabbit config file,
-fetch the raw content from GitHub and save it locally under:
+For every repo in results/repositories.parquet, search for a CodeRabbit
+config file on GitHub and save the first matching file locally under:
 
     configs/<owner>__<repo>__<filename>
 
@@ -144,13 +144,10 @@ def main():
     start_time = time.time()
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    # Read repos that have a config file (detected via heuristic = "Configuration File")
+    # Check every repo against the known config file names.
     df = pd.read_parquet(INPUT_CSV)
     repos = []
     for _, row in df.iterrows():
-        if str(row.get("coderabbit_method_heuristic", "")).strip() != "Configuration File":
-            continue
-        # Specific filename not stored; try all known targets at download time
         repos.append((row["repo_name"], TARGETS))
 
     print(f"Repos to download: {len(repos)}")

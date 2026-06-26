@@ -28,6 +28,20 @@ OUTPUT_PARQUET = "results/commits.parquet"
 MAX_WORKERS = 5
 PER_PAGE = 100
 
+COMMIT_COLUMNS = [
+    "repo_id",
+    "repo",
+    "pr_id",
+    "pr_number",
+    "commit_id",
+    "sha",
+    "message",
+    "finishing_touch",
+    "author_name",
+    "author_date",
+    "url",
+]
+
 GITHUB_TOKEN_1 = os.environ.get("GITHUB_TOKEN_1", "")
 GITHUB_TOKEN_2 = os.environ.get("GITHUB_TOKEN_2", "")
 GITHUB_TOKEN_3 = os.environ.get("GITHUB_TOKEN_3", "")
@@ -102,6 +116,14 @@ def classify_commit(message: str) -> str:
     return "Other"
 
 
+def _normalize_commit_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if "commit_activity_type" in df.columns and "finishing_touch" not in df.columns:
+        df = df.rename(columns={"commit_activity_type": "finishing_touch"})
+    if "commit_id" not in df.columns:
+        df["commit_id"] = df["pr_id"].astype(str) + "_" + df["sha"].astype(str)
+    return df.reindex(columns=COMMIT_COLUMNS)
+
+
 def _item_to_record(item: dict, repo_id: int, repo_name: str, pr_id: str, pr_number: int) -> dict | None:
     """Return a record only if the commit was authored by coderabbitai[bot]."""
     gh_author = item.get("author") or {}
@@ -109,14 +131,16 @@ def _item_to_record(item: dict, repo_id: int, repo_name: str, pr_id: str, pr_num
         return None
     commit = item.get("commit", {})
     author = commit.get("author", {})
+    sha = item.get("sha")
     return {
         "repo_id": repo_id,
         "repo": repo_name,
         "pr_id": pr_id,
         "pr_number": pr_number,
-        "sha": item.get("sha"),
+        "commit_id": f"{pr_id}_{sha}",
+        "sha": sha,
         "message": commit.get("message"),
-        "commit_activity_type": classify_commit(commit.get("message", "")),
+        "finishing_touch": classify_commit(commit.get("message", "")),
         "author_name": author.get("name"),
         "author_date": author.get("date"),
         "url": item.get("html_url"),
@@ -169,6 +193,7 @@ def main():
     already_done: set[tuple] = set()
     if os.path.exists(OUTPUT_PARQUET):
         existing_df = pd.read_parquet(OUTPUT_PARQUET)
+        existing_df = _normalize_commit_columns(existing_df)
         all_commits = existing_df.to_dict("records")
         already_done = set(zip(existing_df["repo"], existing_df["pr_number"]))
         prs = [(rid, repo, pr_id, pr) for rid, repo, pr_id, pr in prs if (repo, pr) not in already_done]
@@ -185,7 +210,7 @@ def main():
             all_commits.extend(commits)
             completed += 1
             if completed % 20 == 0:
-                pd.DataFrame(all_commits).to_parquet(OUTPUT_PARQUET, index=False)
+                pd.DataFrame(all_commits, columns=COMMIT_COLUMNS).to_parquet(OUTPUT_PARQUET, index=False)
                 print(f"  [checkpoint] Saved {len(all_commits)} commits so far.")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -200,7 +225,7 @@ def main():
             except Exception as e:
                 print(f"  Error processing {key}: {e}")
 
-    final_df = pd.DataFrame(all_commits)
+    final_df = pd.DataFrame(all_commits, columns=COMMIT_COLUMNS)
     final_df.to_parquet(OUTPUT_PARQUET, index=False)
     print(f"\nDone. {len(all_commits)} commits saved to {OUTPUT_PARQUET}")
 
@@ -209,13 +234,13 @@ def main():
     pr_df = pd.read_parquet(INPUT_PARQUET)
 
     # Use the full commits.parquet for enrichment (covers resumed runs too)
-    full_commits_df = pd.read_parquet(OUTPUT_PARQUET, columns=["pr_id", "commit_activity_type"])
+    full_commits_df = pd.read_parquet(OUTPUT_PARQUET, columns=["pr_id", "finishing_touch"])
     commit_types = (
         full_commits_df
-        .groupby("pr_id")["commit_activity_type"]
+        .groupby("pr_id")["finishing_touch"]
         .apply(lambda x: sorted(set(x)))
         .reset_index()
-        .rename(columns={"commit_activity_type": "commit_types"})
+        .rename(columns={"finishing_touch": "commit_types"})
     )
 
     pr_df = pr_df.merge(commit_types, on="pr_id", how="left")
@@ -226,10 +251,14 @@ def main():
         # strip any already-flattened string (re-entrancy safe)
         if len(base_list) == 1 and ":" in base_list[0]:
             base_list = [base_list[0].split(":")[0].split(",")[0].strip()]
+        if base_list == ["Reviewed PR"] or base_list == ["Reviewed PR with Finishing Touch"]:
+            base_list = ["Reviewer"]
+        if base_list == ["Finishing Touch PR"]:
+            base_list = ["Author"]
         extra = list(row["commit_types"]) if isinstance(row["commit_types"], (list, tuple)) else []
         combined = base_list + [t for t in extra if t not in base_list]
-        if combined == ["Authored"]:
-            combined = ["Authored", "Other"]
+        if combined == ["Author"]:
+            combined = ["Author", "Other"]
         return combined
 
     def flatten_activity(value) -> str:
@@ -240,7 +269,15 @@ def main():
         rest = items[1:]
         if rest:
             authored_part = ", ".join(rest)
-            return f"Reviewed, Authored: {authored_part}" if first == "Reviewed" else f"{first}: {authored_part}"
+            if first == "Reviewer":
+                return f"Reviewed PR with Finishing Touch: {authored_part}"
+            if first == "Author":
+                return f"Finishing Touch PR: {authored_part}"
+            return f"{first}: {authored_part}"
+        if first == "Reviewer":
+            return "Reviewed PR"
+        if first == "Author":
+            return "Finishing Touch PR"
         return first
 
     pr_df["coderabbit_activity"] = pr_df.apply(build_activity_list, axis=1).apply(flatten_activity)
